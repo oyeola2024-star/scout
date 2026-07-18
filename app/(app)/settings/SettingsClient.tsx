@@ -21,15 +21,32 @@ function normalizeEmail(email: unknown) {
 }
 
 function hasActiveSafetyOverride(account: GmailAccount) {
-  return Boolean(account.safety_override_until && new Date(account.safety_override_until).getTime() > Date.now());
+  return Boolean(account.safety_override_active);
+}
+
+function hasActiveHardRestriction(account: GmailAccount) {
+  if (!account.hard_restriction_active) return false;
+  if (!account.hard_restricted_until) return true;
+  return new Date(account.hard_restricted_until).getTime() > Date.now();
 }
 
 function isPaused(account: GmailAccount) {
+  if (hasActiveHardRestriction(account)) return true;
   if (hasActiveSafetyOverride(account)) return false;
   if (account.is_paused === true) return true;
   if (["paused", "limit_hit", "blocked"].includes(String(account.status || "").toLowerCase())) return true;
   if (!account.paused_until) return false;
   return new Date(account.paused_until).getTime() > Date.now();
+}
+
+function humanStage(value: unknown) {
+  return String(value || 'assessment').replace(/_/g, ' ').replace(/\b\w/g, (letter) => letter.toUpperCase());
+}
+
+function readableDate(value: unknown) {
+  if (!value) return '';
+  const date = new Date(String(value));
+  return Number.isNaN(date.getTime()) ? '' : date.toLocaleString();
 }
 
 function isAutomaticSafetyPause(account: GmailAccount) {
@@ -264,12 +281,12 @@ export default function SettingsClient({ workspace }: { workspace: Workspace }) 
       });
       const json = await response.json().catch(() => ({}));
       if (!response.ok || json?.success === false) throw new Error(json?.error || json?.message || `Profile check failed with HTTP ${response.status}`);
-      setStatus(`Verified sender: ${json.email || account.email}`);
+      setStatus(`Gmail connection verified for ${json.email || account.email}.`);
       await loadAccounts();
     } catch (err) {
       const msg = formatError(err);
       setError(msg);
-      await supabase.from('gmail_accounts').update({ status: 'error', last_error: msg }).eq('workspace_id', workspace.id).eq('id', account.id);
+      await supabase.from('gmail_accounts').update({ connection_status: 'error', connection_error: msg, last_error: msg }).eq('workspace_id', workspace.id).eq('id', account.id);
       await loadAccounts();
     } finally {
       setBusy(false);
@@ -278,9 +295,8 @@ export default function SettingsClient({ workspace }: { workspace: Workspace }) 
 
   function senderSettingsPatch(account: GmailAccount) {
     const draft = limitDrafts[account.id];
-    const dailyMaximum = senderSystemDailyMax(account);
-    const runMaximum = senderSystemRunMax(account);
-    if (dailyMaximum < 1 || runMaximum < 1) throw new Error(`This sender is paused or has no current sending allowance. ${account.health_reason || ''}`.trim());
+    const dailyMaximum = Math.max(1, Number(account.deployment_cap || 250));
+    const runMaximum = Math.max(1, Math.min(dailyMaximum, Number(account.deployment_run_cap || dailyMaximum)));
     const dailyLimit = Math.max(1, Math.min(dailyMaximum, Number(draft?.daily_limit || account.daily_limit || dailyMaximum)));
     const defaultRunLimit = Math.max(1, Math.min(runMaximum, dailyLimit, Number(draft?.default_run_limit || account.default_run_limit || runMaximum)));
     return {
@@ -408,7 +424,7 @@ export default function SettingsClient({ workspace }: { workspace: Workspace }) 
       seed_test_address: String(account.seed_test_address || account.email || '')
     };
     setLimitDrafts((cur) => ({ ...cur, [account.id]: { ...draft, seed_inbox_enabled: enabled } }));
-    setStatus(enabled ? `Seed receiver enabled for ${account.email}. Click Run seed inbox test now to check placement.` : `Seed receiver disabled for ${account.email}.`);
+    setStatus(enabled ? `Seed receiver enabled for ${account.email}. Click Run inbox-placement test to check placement.` : `Seed receiver disabled for ${account.email}.`);
     try {
       const { error: updateError } = await supabase
         .from('gmail_accounts')
@@ -455,9 +471,22 @@ export default function SettingsClient({ workspace }: { workspace: Workspace }) 
     try {
       const paused = isPaused(account) || account.status === 'paused' || account.status === 'limit_hit';
       let action = paused ? 'resume' : 'pause';
+      if (paused && hasActiveHardRestriction(account)) {
+        const until = readableDate(account.hard_restricted_until);
+        throw new Error(`${account.email} is hard-restricted${until ? ` until ${until}` : ' until the required corrective action is completed'}. ${account.hard_restriction_reason || account.paused_reason || ''}`.trim());
+      }
       if (paused && isAutomaticSafetyPause(account)) {
         const reason = String(account.paused_reason || account.health_reason || account.last_error || 'Scout paused this Gmail account for safety.');
-        const confirmed = window.confirm(`${account.email} was automatically paused.\n\nReason: ${reason}\n\nYou may resume it temporarily for 30 minutes, but Scout recommends pausing it again unless you are only testing a small controlled send. Any repeated limit, block, or failure will pause it immediately.\n\nResume temporarily?`);
+        const issueCount = Number(account.pause_issue_count || 1);
+        const confirmed = window.confirm(`${account.email} was automatically paused.
+
+Reason: ${reason}
+
+Occurrence: ${issueCount} of 3 during the current 14-day issue window.
+
+Scout will resume it in Recovering stage with a maximum of 50 messages per rolling 24 hours. The warning remains visible. If the same issue happens again, Scout will pause it again. After the third occurrence, the Gmail will be hard-restricted for the safety period shown by Scout.
+
+Resume this Gmail with warning?`);
         if (!confirmed) return;
         action = 'temporary_resume';
       }
@@ -468,8 +497,8 @@ export default function SettingsClient({ workspace }: { workspace: Workspace }) 
       });
       const json = await response.json().catch(() => ({}));
       if (!response.ok || json?.success === false) throw new Error(json?.error || `Sender update failed with HTTP ${response.status}`);
-      setStatus(json?.temporary
-        ? `${account.email} is temporarily active for 30 minutes. Warning: ${json.warning || account.paused_reason || account.health_reason || 'Scout safety pause remains relevant.'}`
+      setStatus(json?.resumedWithWarning
+        ? `${account.email} resumed at the Recovering limit of ${Number(json.currentCap || 50)} messages/day. Warning: ${json.warning || account.paused_reason || account.health_reason || 'The original safety reason still applies.'}`
         : action === 'pause'
           ? `${account.email} was paused.`
           : `${account.email} was resumed.`);
@@ -712,21 +741,41 @@ export default function SettingsClient({ workspace }: { workspace: Workspace }) 
         </div>
 
 
-        <div className="table-wrap" style={{ marginTop: 14 }}><table><thead><tr><th>Email</th><th>Status</th><th>Limits</th><th>Seed receiver</th><th>Total sent</th><th>Actions</th></tr></thead><tbody>
+        <div className="table-wrap" style={{ marginTop: 14 }}><table><thead><tr><th>Gmail</th><th>Connection and sending health</th><th>Limits</th><th>Seed receiver</th><th>Total sent</th><th>Actions</th></tr></thead><tbody>
           {accounts.map((account) => {
-            const draft = limitDrafts[account.id] || { daily_limit: String(Math.min(Number(account.daily_limit || account.deployment_cap || 250), senderSystemDailyMax(account) || Number(account.deployment_cap || 250))), default_run_limit: String(Math.min(Number(account.default_run_limit || account.deployment_run_cap || 50), senderSystemRunMax(account) || Number(account.deployment_run_cap || 50))), account_type: String(account.account_type || 'gmail'), seed_inbox_enabled: Boolean(account.seed_inbox_enabled), seed_test_address: String(account.seed_test_address || account.email || '') };
+            const deploymentCap = Math.max(1, Number(account.deployment_cap || 250));
+            const deploymentRunCap = Math.max(1, Math.min(deploymentCap, Number(account.deployment_run_cap || deploymentCap)));
+            const draft = limitDrafts[account.id] || { daily_limit: String(Math.min(Number(account.daily_limit || deploymentCap), deploymentCap)), default_run_limit: String(Math.min(Number(account.default_run_limit || deploymentRunCap), deploymentRunCap)), account_type: String(account.account_type || 'gmail'), seed_inbox_enabled: Boolean(account.seed_inbox_enabled), seed_test_address: String(account.seed_test_address || account.email || '') };
+            const hardRestricted = hasActiveHardRestriction(account);
+            const warningResume = hasActiveSafetyOverride(account);
+            const paused = isPaused(account);
+            const connection = String(account.connection_status || ((account.access_token || account.refresh_token) ? 'not checked' : 'needs reconnect'));
+            const sendingState = hardRestricted ? 'Hard restricted' : paused ? 'Paused' : warningResume ? 'Resumed with warning' : 'Active';
+            const reason = account.hard_restriction_reason || account.paused_reason || account.health_reason || 'Checkpoint-controlled sender health.';
+            const issueCount = Number(account.pause_issue_count || 0);
             return <tr key={account.id}>
-              <td><strong>{account.email}</strong><br /><span className="muted">{account.last_error || (account.paused_until ? `Paused until ${new Date(account.paused_until).toLocaleString()}` : 'Ready')}</span></td>
-              <td><span className={`status ${isPaused(account) ? 'paused' : account.status}`}>{isPaused(account) ? 'paused' : hasActiveSafetyOverride(account) ? 'temporary resume' : account.status}</span><br /><strong>{String(account.health_stage || 'assessment').replace(/_/g, ' ')}</strong><br /><span className="muted">{account.health_reason || 'Checkpoint-controlled sender health'}</span>{hasActiveSafetyOverride(account) ? <div className="warning" style={{ marginTop: 8 }}><strong>Temporary resume warning</strong><br />{account.safety_override_warning || account.paused_reason || 'Scout previously paused this sender for safety.'}<br />Active until {new Date(account.safety_override_until || '').toLocaleString()}. Scout recommends pausing it again after a small test.</div> : null}<br /><select className="select" value={draft.account_type} onChange={(e) => setLimitDrafts((cur) => ({ ...cur, [account.id]: { ...draft, account_type: e.target.value } }))}><option value="gmail">Gmail</option><option value="workspace">Workspace</option><option value="other">Other</option></select></td>
-              <td className="sender-limits-cell"><div className="sender-limits-grid"><div><label className="label">Preferred daily maximum</label><input className="input sender-limit-input" type="number" inputMode="numeric" min={1} max={Math.max(1, senderSystemDailyMax(account))} value={draft.daily_limit} placeholder={String(Math.max(1, senderSystemDailyMax(account)))} required aria-label={`Preferred daily maximum for ${account.email}`} onBlur={(e) => { if (!e.target.value.trim()) setLimitDrafts((cur) => ({ ...cur, [account.id]: { ...draft, daily_limit: String(Math.max(1, senderSystemDailyMax(account))) } })); }} onChange={(e) => setLimitDrafts((cur) => ({ ...cur, [account.id]: { ...draft, daily_limit: e.target.value } }))} /><span className="muted sender-limit-hint">System maximum now: {senderSystemDailyMax(account).toLocaleString()}/24h · deployment cap {Number(account.deployment_cap || 250).toLocaleString()}</span></div><div><label className="label">Preferred maximum per run</label><input className="input sender-limit-input" type="number" inputMode="numeric" min={1} max={Math.max(1, senderSystemRunMax(account))} value={draft.default_run_limit} placeholder={String(Math.max(1, senderSystemRunMax(account)))} required aria-label={`Preferred maximum per run for ${account.email}`} onBlur={(e) => { if (!e.target.value.trim()) setLimitDrafts((cur) => ({ ...cur, [account.id]: { ...draft, default_run_limit: String(Math.max(1, senderSystemRunMax(account))) } })); }} onChange={(e) => setLimitDrafts((cur) => ({ ...cur, [account.id]: { ...draft, default_run_limit: e.target.value } }))} /><span className="muted sender-limit-hint">System run maximum now: {senderSystemRunMax(account).toLocaleString()} · server enforcement cannot be bypassed</span></div></div></td>
-              <td><label className="checkbox-row"><input type="checkbox" checked={draft.seed_inbox_enabled} onChange={(e) => toggleSeedInbox(account, e.target.checked)} /> Use as seed receiver</label><span className="muted" style={{ display: 'block', fontSize: 12 }}>Receives test emails from sender accounts. It does not send outreach unless also used as a sender.</span><input className="input" value={draft.seed_test_address} onChange={(e) => setLimitDrafts((cur) => ({ ...cur, [account.id]: { ...draft, seed_test_address: e.target.value } }))} placeholder="seed inbox email" /></td>
+              <td><strong>{account.email}</strong><br /><span className="muted">Type: {draft.account_type}</span></td>
+              <td>
+                <div><strong>Connection:</strong> <span className={`status ${connection === 'verified' ? 'connected' : connection === 'error' ? 'error' : 'paused'}`}>{connection}</span></div>
+                {account.connection_verified_at ? <div className="muted">Last checked: {readableDate(account.connection_verified_at)}</div> : <div className="muted">Click Check Gmail connection to verify Google access.</div>}
+                {account.connection_error ? <div className="error" style={{ marginTop: 6 }}>{account.connection_error}</div> : null}
+                <div style={{ marginTop: 8 }}><strong>Sending state:</strong> <span className={`status ${hardRestricted || paused ? 'paused' : 'connected'}`}>{sendingState}</span></div>
+                <div><strong>Health stage:</strong> {humanStage(account.health_stage)}</div>
+                <div className="muted" style={{ marginTop: 6 }}><strong>Reason:</strong> {reason}</div>
+                {issueCount > 0 ? <div className="muted"><strong>Same-issue occurrences:</strong> {issueCount} of 3{account.pause_issue_window_ends_at ? ` · window ends ${readableDate(account.pause_issue_window_ends_at)}` : ''}</div> : null}
+                {hardRestricted ? <div className="warning" style={{ marginTop: 8 }}><strong>Resume unavailable</strong><br />{account.hard_restricted_until ? `Available again after ${readableDate(account.hard_restricted_until)}.` : 'This restriction remains until the required corrective action is completed.'}</div> : null}
+                {warningResume ? <div className="warning" style={{ marginTop: 8 }}><strong>Resumed with warning</strong><br />{account.safety_override_warning || reason}<br />If the same issue happens again, Scout will pause this Gmail again.</div> : null}
+                <select className="select" style={{ marginTop: 8 }} value={draft.account_type} onChange={(e) => setLimitDrafts((cur) => ({ ...cur, [account.id]: { ...draft, account_type: e.target.value } }))}><option value="gmail">Gmail</option><option value="workspace">Workspace</option><option value="other">Other</option></select>
+              </td>
+              <td className="sender-limits-cell"><div className="sender-limits-grid"><div><label className="label">Preferred daily maximum</label><input className="input sender-limit-input" type="number" inputMode="numeric" min={1} max={deploymentCap} value={draft.daily_limit} placeholder={String(deploymentCap)} required aria-label={`Preferred daily maximum for ${account.email}`} onBlur={(e) => { if (!e.target.value.trim()) setLimitDrafts((cur) => ({ ...cur, [account.id]: { ...draft, daily_limit: String(deploymentCap) } })); }} onChange={(e) => setLimitDrafts((cur) => ({ ...cur, [account.id]: { ...draft, daily_limit: e.target.value } }))} /><span className="muted sender-limit-hint">Current system allowance: {senderSystemDailyMax(account).toLocaleString()}/24h · deployment ceiling {deploymentCap.toLocaleString()}</span></div><div><label className="label">Preferred maximum per run</label><input className="input sender-limit-input" type="number" inputMode="numeric" min={1} max={deploymentRunCap} value={draft.default_run_limit} placeholder={String(deploymentRunCap)} required aria-label={`Preferred maximum per run for ${account.email}`} onBlur={(e) => { if (!e.target.value.trim()) setLimitDrafts((cur) => ({ ...cur, [account.id]: { ...draft, default_run_limit: String(deploymentRunCap) } })); }} onChange={(e) => setLimitDrafts((cur) => ({ ...cur, [account.id]: { ...draft, default_run_limit: e.target.value } }))} /><span className="muted sender-limit-hint">Current system run allowance: {senderSystemRunMax(account).toLocaleString()} · server enforcement cannot be bypassed</span></div></div></td>
+              <td><label className="checkbox-row"><input type="checkbox" checked={draft.seed_inbox_enabled} onChange={(e) => toggleSeedInbox(account, e.target.checked)} /> Use as seed receiver</label><span className="muted" style={{ display: 'block', fontSize: 12 }}>Receives controlled placement tests. It does not send outreach unless selected as a sender.</span><input className="input" value={draft.seed_test_address} onChange={(e) => setLimitDrafts((cur) => ({ ...cur, [account.id]: { ...draft, seed_test_address: e.target.value } }))} placeholder="seed inbox email" /></td>
               <td><strong>{Number(sentTotalByEmail[normalizeEmail(account.email)] ?? account.sent_today ?? 0).toLocaleString()}</strong><br /><span className="muted">total sent</span><br /><span className="muted">Signature: {account.signature_enabled === false ? 'off' : account.signature_text || account.signature_html || account.signature_logo_url ? 'on' : 'empty'}</span></td>
-              <td><button className="btn secondary" type="button" disabled={busy} onClick={() => saveSenderSettings(account)}>Save sender settings</button> <button className="btn secondary" type="button" disabled={busy || !(account.access_token || account.refresh_token)} onClick={() => verifySenderProfile(account)}>Verify</button> <button className="btn secondary" type="button" disabled={busy} onClick={() => pauseOrResume(account)}>{isPaused(account) || account.status !== 'connected' ? (isAutomaticSafetyPause(account) ? 'Resume temporarily' : 'Resume') : 'Pause'}</button> <button className="btn secondary" type="button" disabled={busy} onClick={() => removeAccount(account)}>Remove</button></td>
+              <td><button className="btn secondary" type="button" disabled={busy} onClick={() => saveSenderSettings(account)}>Save limits & test settings</button> <button className="btn secondary" type="button" disabled={busy || !(account.access_token || account.refresh_token)} onClick={() => verifySenderProfile(account)}>Check Gmail connection</button> <button className="btn secondary" type="button" disabled={busy || hardRestricted} onClick={() => pauseOrResume(account)}>{paused ? (isAutomaticSafetyPause(account) ? 'Resume with warning' : 'Resume Gmail') : 'Pause Gmail'}</button> <button className="btn secondary" type="button" disabled={busy} onClick={() => removeAccount(account)}>Disconnect from Scout</button></td>
             </tr>;
           })}
-          {!accounts.length ? <tr><td colSpan={6} className="muted">No senders connected yet. Click Connect Gmail, approve permissions, and this table should update after Google redirects back.</td></tr> : null}
+          {!accounts.length ? <tr><td colSpan={6} className="muted">No Gmail accounts connected. Click Connect Gmail and approve the requested permissions.</td></tr> : null}
         </tbody></table></div>
-        <div className="actions" style={{ marginTop: 12 }}><button className="btn secondary" type="button" disabled={busy} onClick={runSeedTestNow}>Run seed inbox test now</button><span className="muted">Seed receiver checkboxes save automatically. For real testing, connect at least 2 Gmail accounts so they can test each other.</span></div>
+        <div className="actions" style={{ marginTop: 12 }}><button className="btn secondary" type="button" disabled={busy} onClick={runSeedTestNow}>Run inbox-placement test</button><span className="muted">Connect at least two Gmail accounts so one sender can test another seed receiver.</span></div>
         <div className="table-wrap" style={{ marginTop: 12 }}><table><thead><tr><th>Sender</th><th>Seed receiver</th><th>Placement</th><th>Checked</th></tr></thead><tbody>
           {seedTests.map((row) => <tr key={row.id}><td>{row.sender_email}</td><td>{row.seed_email}</td><td><span className={`status ${row.placement || 'pending'}`}>{row.placement || 'pending'}</span></td><td>{row.checked_at || row.created_at ? new Date(row.checked_at || row.created_at || '').toLocaleString() : '-'}</td></tr>)}
           {!seedTests.length ? <tr><td colSpan={4} className="muted">No seed inbox tests yet. Turn on Use as seed receiver for one account, then click Run seed inbox test now. You need at least 2 connected Gmail accounts for cross-account testing.</td></tr> : null}

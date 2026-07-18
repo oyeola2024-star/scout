@@ -41,13 +41,14 @@ export async function POST(request: NextRequest) {
       if (!account.refresh_token) throw new Error('No refresh token stored. Reconnect Gmail in Settings.');
       const refreshed = await refreshAccessToken(String(account.refresh_token));
       accessToken = refreshed.access_token;
-      await supabase.from('gmail_accounts').update({ access_token: accessToken, expires_at: new Date(Date.now() + refreshed.expires_in * 1000).toISOString(), last_error: null }).eq('workspace_id', workspaceId).eq('id', accountId);
+      await supabase.from('gmail_accounts').update({ access_token: accessToken, expires_at: new Date(Date.now() + refreshed.expires_in * 1000).toISOString(), last_error: null, connection_error: null }).eq('workspace_id', workspaceId).eq('id', accountId);
     }
     const response = await fetch('https://gmail.googleapis.com/gmail/v1/users/me/profile', { headers: { authorization: `Bearer ${accessToken}` }, signal: AbortSignal.timeout(12000) });
     const profile = await response.json().catch(() => ({}));
     if (!response.ok) throw new Error(profile?.error?.message || profile?.error || `Gmail profile failed with HTTP ${response.status}`);
     const email = String(profile.emailAddress || account.email || '').toLowerCase();
-    await supabase.from('gmail_accounts').update({ email, display_name: email, status: 'connected', access_token: accessToken, last_error: null, raw: { ...(account.raw || {}), last_profile_check: new Date().toISOString(), profile } }).eq('workspace_id', workspaceId).eq('id', accountId);
+    const checkedAt = new Date().toISOString();
+    await supabase.from('gmail_accounts').update({ email, display_name: email, status: account.is_paused ? account.status : 'connected', connection_status: 'verified', connection_verified_at: checkedAt, connection_error: null, access_token: accessToken, last_error: null, raw: { ...(account.raw || {}), last_profile_check: checkedAt, profile } }).eq('workspace_id', workspaceId).eq('id', accountId);
     return NextResponse.json({ success: true, email, profile, access_token: accessToken });
   } catch (err) {
     return NextResponse.json({ success: false, error: formatError(err) }, { status: 400 });

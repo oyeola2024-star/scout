@@ -4,12 +4,18 @@ import { NextRequest, NextResponse } from 'next/server';
 import { createAdminClient } from '@/lib/supabase-admin';
 import { requireWorkspaceAccess } from '@/lib/require-workspace-access';
 import { createAppNotification } from '@/lib/notifications';
-import { recordSenderHealthEvent } from '@/lib/sender-health';
+import { issuePolicy, recordSenderHealthEvent } from '@/lib/sender-health';
 
 function formatError(error: unknown) {
   if (error instanceof Error) return error.message;
   if (typeof error === 'string') return error;
   try { return JSON.stringify(error); } catch { return String(error); }
+}
+
+function hardRestrictionActive(account: Record<string, any>) {
+  if (!account.hard_restriction_active) return false;
+  if (!account.hard_restricted_until) return true;
+  return new Date(account.hard_restricted_until).getTime() > Date.now();
 }
 
 export async function POST(request: NextRequest) {
@@ -35,15 +41,18 @@ export async function POST(request: NextRequest) {
     const warning = String(account.paused_reason || account.health_reason || account.last_error || 'Scout paused this Gmail account for safety.');
 
     if (action === 'pause') {
-      if (automaticPause) {
+      if (automaticPause && account.safety_override_active) {
         const now = new Date().toISOString();
         const { error: restoreError } = await supabase
           .from('gmail_accounts')
           .update({
             is_paused: true,
             status: account.pause_kind === 'provider_limit' ? 'limit_hit' : 'paused',
+            health_stage: 'restricted',
+            health_cap: 0,
             paused_reason: warning,
             health_reason: warning,
+            safety_override_active: false,
             safety_override_until: null,
             safety_override_warning: null,
             updated_at: now,
@@ -55,12 +64,13 @@ export async function POST(request: NextRequest) {
           workspace_id: workspaceId,
           gmail_account_id: accountId,
           event_type: 'manual_pause',
-          reason: `Temporary resume ended by the user. Original safety pause restored: ${warning}`,
+          reason: `User ended the warned resume and restored the original safety pause: ${warning}`,
           raw: { restored_pause_kind: account.pause_kind, restored_paused_until: account.paused_until },
           created_at: now,
         });
         return NextResponse.json({ success: true, status: 'paused', restoredSafetyPause: true, warning });
       }
+
       await recordSenderHealthEvent(supabase as any, {
         workspaceId,
         gmailAccountId: accountId,
@@ -70,13 +80,25 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ success: true, status: 'paused' });
     }
 
+    if (hardRestrictionActive(account)) {
+      const until = account.hard_restricted_until || null;
+      return NextResponse.json({
+        success: false,
+        code: 'hard_restriction_active',
+        error: account.hard_restriction_reason || warning,
+        hardRestrictedUntil: until,
+        issueCount: Number(account.pause_issue_count || 3),
+      }, { status: 423 });
+    }
+
     if (action === 'resume') {
       if (automaticPause) {
         return NextResponse.json({
           success: false,
-          code: 'temporary_resume_required',
+          code: 'warning_resume_required',
           error: warning,
           pauseKind: account.pause_kind,
+          issueCount: Number(account.pause_issue_count || 1),
         }, { status: 409 });
       }
       await recordSenderHealthEvent(supabase as any, {
@@ -103,15 +125,24 @@ export async function POST(request: NextRequest) {
       gmailAccountId: accountId,
       eventType: 'temporary_resume',
       reason: warning,
-      raw: { pause_kind: account.pause_kind, original_paused_until: account.paused_until },
+      raw: {
+        pause_kind: account.pause_kind,
+        issue_count: Number(account.pause_issue_count || 1),
+        original_paused_until: account.paused_until,
+      },
     });
 
-    const overrideUntil = new Date(Date.now() + 30 * 60 * 1000).toISOString();
+    const policy = issuePolicy(String(account.pause_kind || ''));
+    const issueCount = Number(account.pause_issue_count || 1);
+    const nextConsequence = issueCount >= 2
+      ? `If the same issue happens again, Scout will hard-restrict this Gmail ${policy?.hardRestrictionMs === null ? 'until the recipient list is cleaned' : 'for the required safety period'}.`
+      : 'If the same issue happens again, Scout will pause this Gmail and increase its issue count.';
+
     await createAppNotification(supabase as any, {
       workspaceId,
-      type: 'sender_temporary_resume_warning',
-      title: `Temporary resume warning: ${account.email}`,
-      message: `${warning} This Gmail account is temporarily active for 30 minutes. Scout recommends pausing it again unless you are only testing a small controlled send. Any repeated provider limit, block, or failure will pause it immediately.`,
+      type: 'sender_resume_warning',
+      title: `Resumed with warning: ${account.email}`,
+      message: `${warning} Scout resumed this Gmail at the Recovering limit of 50/day. ${nextConsequence}`,
       entityType: 'gmail_account',
       entityId: accountId,
       raw: {
@@ -119,16 +150,18 @@ export async function POST(request: NextRequest) {
         gmail_email: account.email,
         pause_kind: account.pause_kind,
         original_reason: warning,
-        override_until: overrideUntil,
+        issue_count: issueCount,
       },
     });
 
     return NextResponse.json({
       success: true,
       status: 'connected',
-      temporary: true,
+      resumedWithWarning: true,
       warning,
-      overrideUntil,
+      issueCount,
+      currentCap: 50,
+      nextConsequence,
     });
   } catch (error) {
     return NextResponse.json({ success: false, error: formatError(error) }, { status: 400 });

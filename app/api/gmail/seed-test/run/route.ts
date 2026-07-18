@@ -4,6 +4,7 @@ export const maxDuration = 60;
 import { NextRequest, NextResponse } from 'next/server';
 import { requireWorkspaceAccess } from '@/lib/require-workspace-access';
 import { createAdminClient } from '@/lib/supabase-admin';
+import { recordSenderHealthEvent } from '@/lib/sender-health';
 
 function b64url(input: string) {
   return Buffer.from(input, 'utf8').toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
@@ -157,6 +158,16 @@ async function runSeedInboxTest(workspaceId: string) {
 
       const risk = placement === 'spam' ? 'spam_risk' : placement === 'promotions' ? 'promotion_risk' : placement === 'inbox' ? 'seed_inbox_ok' : placement;
       await supabase.from('gmail_accounts').update({ spam_risk_status: risk, last_seed_result: placement, last_seed_checked_at: new Date().toISOString() }).eq('workspace_id', workspaceId).eq('id', sender.id);
+      if (placement === 'spam') {
+        await recordSenderHealthEvent(supabase as any, {
+          workspaceId,
+          gmailAccountId: String(sender.id),
+          eventType: 'seed_spam',
+          reason: `Seed inbox test to ${seedEmail} landed in Spam.`,
+          recipient: seedEmail,
+          raw: { subject, seed_gmail_account_id: seed.id, placement },
+        });
+      }
       results.push({ sender: sender.email, seed: seedEmail, placement });
   }
 

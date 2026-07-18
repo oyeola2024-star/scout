@@ -76,7 +76,7 @@ function sleep(ms: number) {
 }
 
 function senderDelayMs(_raw: AnyRow) {
-  // v10.36 uses a database-enforced random 90–210 second cooldown per Gmail.
+  // v10.38 uses a database-enforced random 90–210 second cooldown per Gmail.
   // No browser or worker delay setting can shorten it.
   return DEFAULT_SENDER_DELAY_MS;
 }
