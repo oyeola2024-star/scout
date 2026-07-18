@@ -1,0 +1,14 @@
+{
+  "name": "Scout v10.36",
+  "short_name": "Scout",
+  "description": "Research leads, send through connected Gmail accounts, track replies, and enforce adaptive sender safety.",
+  "start_url": "/message",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#111827",
+  "theme_color": "#111827",
+  "icons": [
+    { "src": "/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any maskable" },
+    { "src": "/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable" }
+  ]
+}

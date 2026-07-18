@@ -1,0 +1,21 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "framework": "nextjs",
+  "installCommand": "npm install --no-audit --no-fund --legacy-peer-deps",
+  "buildCommand": "npm run build",
+  "outputDirectory": ".next",
+  "functions": {
+    "app/api/message/run-schedules/route.ts": {
+      "maxDuration": 60
+    },
+    "app/api/gmail/send/route.ts": {
+      "maxDuration": 60
+    },
+    "app/api/cron/inbound-sync/route.ts": {
+      "maxDuration": 60
+    },
+    "app/api/cron/research-worker/route.ts": {
+      "maxDuration": 60
+    }
+  }
+}
