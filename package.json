@@ -1,6 +1,6 @@
 {
-  "name": "scout-app-v10-37-first-time-complete",
-  "version": "10.37.0",
+  "name": "scout-app-v10-38-team",
+  "version": "10.38.0",
   "private": true,
   "scripts": {
     "dev": "next dev",
@@ -30,5 +30,5 @@
   "engines": {
     "node": "20.x"
   },
-  "description": "Scout App v10.37: first-time independent deployment, 250/day ceiling, adaptive sender health, app-scoped Gmail reply sync, durable follow-ups, and automatic pacing."
+  "description": "Scout App v10.38 Team: independent deployment, adaptive sender health, three-strike hard restrictions, app-scoped Gmail reply sync, durable follow-ups, and automatic pacing."
 }

@@ -1,5 +1,5 @@
 -- =============================================================================
--- SCOUT v10.36.7 FRESH INSTALLATION
+-- SCOUT v10.38.0 FRESH INSTALLATION
 -- Run this in a new Supabase project before anyone signs up. It is safe to run again after a partial error.
 -- It creates the entire Scout schema, RLS policies, functions, signup provisioning,
 -- adaptive sender limits, free basic email verification, team duplicate protection,
@@ -7,7 +7,7 @@
 --
 -- This file is intentionally consolidated. Do not run the old standalone repair SQL
 -- files after this fresh-install script.
--- Generated from the validated v10.34 working base plus v10.36 adaptive changes.
+-- Generated from the validated v10.34 working base plus v10.38 adaptive sender-health changes.
 -- =============================================================================
 
 
@@ -847,7 +847,9 @@ values
   ('00000000-0000-4000-8000-000000000001', 'Shopify marketing scouting', 'Messages focused on traffic quality, email capture, abandoned cart, and retention.')
 on conflict (workspace_id, name) do nothing;
 
-create or replace function public.get_due_followups(
+drop function if exists public.count_due_followups(uuid, text);
+drop function if exists public.get_due_followups(uuid, integer, text);
+create function public.get_due_followups(
   target_workspace uuid,
   limit_rows int default 100
 )
@@ -978,7 +980,9 @@ create policy "seed_inbox_tests delete member" on public.seed_inbox_tests for de
 
 
 -- Ensure due follow-ups RPC exists for Message page.
-create or replace function public.get_due_followups(
+drop function if exists public.count_due_followups(uuid, text);
+drop function if exists public.get_due_followups(uuid, integer, text);
+create function public.get_due_followups(
   target_workspace uuid,
   limit_rows int default 100
 )
@@ -1825,7 +1829,9 @@ create policy outreach_events_member_all on public.outreach_events for all using
 drop policy if exists no_inbox_records_member_all on public.no_inbox_records;
 create policy no_inbox_records_member_all on public.no_inbox_records for all using (public.is_workspace_member(workspace_id)) with check (public.is_workspace_member(workspace_id));
 
-create or replace function public.get_due_followups(
+drop function if exists public.count_due_followups(uuid, text);
+drop function if exists public.get_due_followups(uuid, integer, text);
+create function public.get_due_followups(
   target_workspace uuid,
   limit_rows int default 100
 )
@@ -2203,7 +2209,9 @@ on public.no_inbox_records(workspace_id, business_id, created_at desc);
 -- Safe re-run: PostgreSQL cannot change a table-returning function's output columns in place.
 drop function if exists public.get_due_followups(uuid, integer, text);
 
-create or replace function public.get_due_followups(
+drop function if exists public.count_due_followups(uuid, text);
+drop function if exists public.get_due_followups(uuid, integer, text);
+create function public.get_due_followups(
   target_workspace uuid,
   limit_rows int default 100,
   followup_segment text default 'all_unanswered'
@@ -2921,7 +2929,9 @@ where t.workspace_id = c.workspace_id
 -- Safe re-run: PostgreSQL cannot change a table-returning function's output columns in place.
 drop function if exists public.get_due_followups(uuid, integer, text);
 
-create or replace function public.get_due_followups(
+drop function if exists public.count_due_followups(uuid, text);
+drop function if exists public.get_due_followups(uuid, integer, text);
+create function public.get_due_followups(
   target_workspace uuid,
   limit_rows int default 100,
   followup_segment text default 'all_unanswered'
@@ -3192,7 +3202,9 @@ create unique index if not exists reply_history_workspace_gmail_message_uid on p
 -- Safe re-run: PostgreSQL cannot change a table-returning function's output columns in place.
 drop function if exists public.get_due_followups(uuid, integer, text);
 
-create or replace function public.get_due_followups(
+drop function if exists public.count_due_followups(uuid, text);
+drop function if exists public.get_due_followups(uuid, integer, text);
+create function public.get_due_followups(
   target_workspace uuid,
   limit_rows int default 100,
   followup_segment text default 'all_unanswered'
@@ -5509,38 +5521,12 @@ select
 -- <<< END SCOUT_V10_37_FINAL_FIRST_INSTALL_PATCH
 
 -- Secure the due-follow-up functions so an authenticated user can only query
--- their own workspace. The service-role worker may query the workspace it is processing.
+-- their own workspace. Drop dependent functions first so this also upgrades an
+-- older Scout database without the PostgreSQL 42P13 return-type error.
 drop function if exists public.count_due_followups(uuid, text);
+drop function if exists public.get_due_followups(uuid, integer, text);
 
-create or replace function public.count_due_followups(
-  target_workspace uuid,
-  followup_segment text default 'all_unanswered'
-)
-returns bigint
-language sql
-security definer
-set search_path = public
-as $$
-  select case
-    when auth.role() = 'service_role' or public.is_workspace_member(target_workspace)
-    then (select count(*) from public.get_due_followups(target_workspace, 2147483647, followup_segment))
-    else 0::bigint
-  end;
-$$;
-
-revoke all on function public.count_due_followups(uuid, text) from public, anon;
-grant execute on function public.count_due_followups(uuid, text) to authenticated, service_role;
-
-notify pgrst, 'reload schema';
-
-select
-  'READY'::text as scout_database_status,
-  250::integer as hard_daily_ceiling,
-  '90-210 seconds'::text as same_gmail_delay,
-  '3-6 seconds'::text as different_gmail_delay,
-  to_regprocedure('public.count_due_followups(uuid,text)') is not null as all_followups_ready;
-
-create or replace function public.get_due_followups(
+create function public.get_due_followups(
   target_workspace uuid,
   limit_rows int default 100,
   followup_segment text default 'all_unanswered'
@@ -5623,8 +5609,301 @@ $$;
 revoke all on function public.get_due_followups(uuid, integer, text) from public, anon;
 grant execute on function public.get_due_followups(uuid, integer, text) to authenticated, service_role;
 
+create function public.count_due_followups(
+  target_workspace uuid,
+  followup_segment text default 'all_unanswered'
+)
+returns bigint
+language sql
+security definer
+set search_path = public
+as $$
+  select case
+    when auth.role() = 'service_role' or public.is_workspace_member(target_workspace)
+    then (select count(*) from public.get_due_followups(target_workspace, 2147483647, followup_segment))
+    else 0::bigint
+  end;
+$$;
+
+revoke all on function public.count_due_followups(uuid, text) from public, anon;
+grant execute on function public.count_due_followups(uuid, text) to authenticated, service_role;
+
 notify pgrst, 'reload schema';
 
+select
+  'READY'::text as scout_database_status,
+  250::integer as hard_daily_ceiling,
+  '90-210 seconds'::text as same_gmail_delay,
+  '3-6 seconds'::text as different_gmail_delay,
+  to_regprocedure('public.count_due_followups(uuid,text)') is not null as all_followups_ready;
 
 alter table if exists public.team_scouted_leads enable row level security;
 notify pgrst, 'reload schema';
+
+-- >>> SCOUT V10.38 FINAL SENDER RECOVERY + THREE-STRIKE PATCH
+alter table if exists public.gmail_accounts add column if not exists safety_override_active boolean not null default false;
+alter table if exists public.gmail_accounts add column if not exists pause_issue_key text;
+alter table if exists public.gmail_accounts add column if not exists pause_issue_count integer not null default 0;
+alter table if exists public.gmail_accounts add column if not exists pause_issue_window_started_at timestamptz;
+alter table if exists public.gmail_accounts add column if not exists pause_issue_window_ends_at timestamptz;
+alter table if exists public.gmail_accounts add column if not exists pause_issue_last_at timestamptz;
+alter table if exists public.gmail_accounts add column if not exists hard_restriction_active boolean not null default false;
+alter table if exists public.gmail_accounts add column if not exists hard_restricted_until timestamptz;
+alter table if exists public.gmail_accounts add column if not exists hard_restriction_reason text;
+alter table if exists public.gmail_accounts add column if not exists hard_restriction_count integer not null default 0;
+alter table if exists public.gmail_accounts add column if not exists connection_status text not null default 'not_checked';
+alter table if exists public.gmail_accounts add column if not exists connection_verified_at timestamptz;
+alter table if exists public.gmail_accounts add column if not exists connection_error text;
+
+create index if not exists gmail_accounts_hard_restriction_idx
+  on public.gmail_accounts(workspace_id, hard_restriction_active, hard_restricted_until);
+
+update public.gmail_accounts
+set safety_override_active = false
+where safety_override_active is null;
+
+drop function if exists public.reserve_sender_send(uuid, uuid, jsonb);
+
+create function public.reserve_sender_send(
+  target_workspace uuid,
+  target_account uuid,
+  reservation_raw jsonb default '{}'::jsonb
+)
+returns table(
+  allowed boolean,
+  reservation_id uuid,
+  reason text,
+  effective_daily_limit integer,
+  used_last_24h integer,
+  remaining integer,
+  dispatch_at timestamptz,
+  next_eligible_at timestamptz
+)
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  a public.gmail_accounts%rowtype;
+  deployment_limit integer;
+  health_limit integer;
+  user_limit integer;
+  effective_limit integer;
+  checkpoint_limit integer;
+  used_count integer;
+  new_reservation uuid;
+  dispatch_time timestamptz;
+  workspace_next timestamptz;
+  next_time timestamptz;
+  workspace_gap_seconds integer;
+  override_active boolean;
+  automatic_pause boolean;
+  timed_pause_expired boolean;
+  hard_active boolean;
+begin
+  select * into a
+  from public.gmail_accounts
+  where id = target_account and workspace_id = target_workspace
+  for update;
+
+  if not found then
+    return query select false, null::uuid, 'Sender account was not found.', 0, 0, 0, null::timestamptz, null::timestamptz;
+    return;
+  end if;
+
+  deployment_limit := 250;
+  override_active := coalesce(a.safety_override_active, false)
+    and coalesce(a.pause_kind, '') <> ''
+    and coalesce(a.pause_kind, '') <> 'manual';
+  hard_active := coalesce(a.hard_restriction_active, false)
+    and (a.hard_restricted_until is null or a.hard_restricted_until > now());
+
+  if coalesce(a.hard_restriction_active, false)
+     and a.hard_restricted_until is not null
+     and a.hard_restricted_until <= now() then
+    update public.gmail_accounts
+    set hard_restriction_active = false,
+        hard_restricted_until = null,
+        hard_restriction_reason = null,
+        pause_issue_key = null,
+        pause_issue_count = 0,
+        pause_issue_window_started_at = null,
+        pause_issue_window_ends_at = null,
+        pause_kind = null,
+        paused_until = null,
+        paused_reason = null,
+        safety_override_active = false,
+        safety_override_until = null,
+        safety_override_warning = null,
+        is_paused = false,
+        status = 'connected',
+        health_stage = 'recovering',
+        health_cap = least(deployment_limit, 25),
+        health_reason = 'The hard restriction ended. Scout restarted this Gmail in Recovering stage at 25/day.',
+        updated_at = now()
+    where id = target_account and workspace_id = target_workspace
+    returning * into a;
+    hard_active := false;
+    override_active := false;
+  end if;
+
+  if hard_active then
+    return query select false, null::uuid,
+      coalesce(a.hard_restriction_reason, a.paused_reason, 'This Gmail is hard-restricted.'),
+      0, 0, 0, null::timestamptz, a.next_eligible_at;
+    return;
+  end if;
+
+  automatic_pause := coalesce(a.pause_kind, '') <> '' and coalesce(a.pause_kind, '') <> 'manual';
+  timed_pause_expired := automatic_pause
+    and coalesce(a.pause_kind, '') <> 'permanent_bounce'
+    and a.paused_until is not null
+    and a.paused_until <= now();
+
+  if timed_pause_expired and not override_active then
+    update public.gmail_accounts
+    set is_paused = false,
+        status = 'connected',
+        pause_kind = null,
+        paused_until = null,
+        paused_reason = null,
+        safety_override_active = false,
+        safety_override_until = null,
+        safety_override_warning = null,
+        health_stage = 'recovering',
+        health_cap = least(deployment_limit, 50),
+        health_reason = 'The timed safety pause ended. Scout restarted this Gmail in Recovering stage at 50/day.',
+        updated_at = now()
+    where id = target_account and workspace_id = target_workspace
+    returning * into a;
+    automatic_pause := false;
+  elsif automatic_pause and not override_active then
+    update public.gmail_accounts
+    set is_paused = true,
+        health_cap = 0,
+        status = case when pause_kind = 'provider_limit' then 'limit_hit' else 'paused' end,
+        safety_override_active = false,
+        safety_override_until = null,
+        updated_at = now()
+    where id = target_account and workspace_id = target_workspace
+    returning * into a;
+  elsif override_active then
+    update public.gmail_accounts
+    set is_paused = false,
+        status = 'connected',
+        health_stage = 'recovering',
+        health_cap = least(deployment_limit, 50),
+        updated_at = now()
+    where id = target_account and workspace_id = target_workspace
+    returning * into a;
+  end if;
+
+  checkpoint_limit := case
+    when coalesce(a.successful_sends, 0) < 25 then least(deployment_limit, 25)
+    when coalesce(a.successful_sends, 0) < 50 then least(deployment_limit, 50)
+    when coalesce(a.successful_sends, 0) < 100 then least(deployment_limit, 100)
+    when coalesce(a.successful_sends, 0) < 150 then least(deployment_limit, 150)
+    else deployment_limit
+  end;
+
+  health_limit := case lower(coalesce(a.health_stage, 'assessment'))
+    when 'assessment' then checkpoint_limit
+    when 'restricted' then least(deployment_limit, 50)
+    when 'recovering' then least(deployment_limit, 75)
+    when 'stable' then least(deployment_limit, 100)
+    when 'established' then least(deployment_limit, 150)
+    when 'healthy' then least(deployment_limit, 200)
+    when 'proven' then deployment_limit
+    when 'paused' then case when override_active then least(deployment_limit, 50) else 0 end
+    else checkpoint_limit
+  end;
+  health_limit := least(health_limit, greatest(0, coalesce(a.health_cap, health_limit)));
+  if override_active then health_limit := least(deployment_limit, 50); end if;
+  user_limit := greatest(1, least(deployment_limit, coalesce(a.daily_limit, deployment_limit)));
+  effective_limit := greatest(0, least(deployment_limit, health_limit, user_limit));
+
+  select count(*)::integer into used_count
+  from public.sender_send_reservations r
+  where r.workspace_id = target_workspace
+    and r.gmail_account_id = target_account
+    and (
+      (r.status = 'sent' and r.finalized_at >= now() - interval '24 hours')
+      or (r.status = 'reserved' and r.expires_at > now())
+    );
+
+  if coalesce(a.pause_kind, '') = 'manual'
+     or (coalesce(a.is_paused, false) and not override_active)
+     or (lower(coalesce(a.status, '')) in ('paused', 'limit_hit', 'blocked', 'error') and not override_active)
+     or (automatic_pause and not override_active) then
+    return query select false, null::uuid,
+      coalesce(a.paused_reason, a.health_reason, a.last_error, 'Sender is paused.'),
+      effective_limit, used_count, greatest(0, effective_limit - used_count), null::timestamptz, a.next_eligible_at;
+    return;
+  end if;
+
+  if a.next_eligible_at is not null and a.next_eligible_at > now() then
+    return query select false, null::uuid, 'Sender cooldown is still active.',
+      effective_limit, used_count, greatest(0, effective_limit - used_count), null::timestamptz, a.next_eligible_at;
+    return;
+  end if;
+
+  if effective_limit <= 0 or used_count >= effective_limit then
+    return query select false, null::uuid, 'Sender reached its effective rolling 24-hour limit.',
+      effective_limit, used_count, greatest(0, effective_limit - used_count), null::timestamptz, a.next_eligible_at;
+    return;
+  end if;
+
+  insert into public.workspace_dispatch_state(workspace_id, next_dispatch_at)
+  values (target_workspace, now())
+  on conflict (workspace_id) do nothing;
+
+  select s.next_dispatch_at into workspace_next
+  from public.workspace_dispatch_state s
+  where s.workspace_id = target_workspace
+  for update;
+
+  dispatch_time := greatest(now(), coalesce(workspace_next, now()));
+  if dispatch_time > now() + interval '45 seconds' then
+    return query select false, null::uuid,
+      'Workspace dispatch slots are full for this worker cycle. Scout will retry automatically.',
+      effective_limit, used_count, greatest(0, effective_limit - used_count), dispatch_time, a.next_eligible_at;
+    return;
+  end if;
+
+  workspace_gap_seconds := 3 + floor(random() * 4)::integer;
+  update public.workspace_dispatch_state
+  set next_dispatch_at = dispatch_time + make_interval(secs => workspace_gap_seconds), updated_at = now()
+  where workspace_id = target_workspace;
+
+  next_time := dispatch_time + make_interval(secs => (90 + floor(random() * 121))::integer);
+  insert into public.sender_send_reservations(
+    workspace_id, gmail_account_id, status, effective_daily_limit, used_before, dispatch_at, expires_at, raw
+  ) values (
+    target_workspace, target_account, 'reserved', effective_limit, used_count, dispatch_time,
+    dispatch_time + interval '10 minutes', coalesce(reservation_raw, '{}'::jsonb)
+  ) returning id into new_reservation;
+
+  update public.gmail_accounts
+  set next_eligible_at = next_time,
+      health_cap = health_limit,
+      updated_at = now()
+  where id = target_account and workspace_id = target_workspace;
+
+  return query select true, new_reservation, 'Reserved.', effective_limit, used_count,
+    greatest(0, effective_limit - used_count - 1), dispatch_time, next_time;
+end;
+$$;
+
+revoke all on function public.reserve_sender_send(uuid, uuid, jsonb) from public, anon, authenticated;
+grant execute on function public.reserve_sender_send(uuid, uuid, jsonb) to service_role;
+
+notify pgrst, 'reload schema';
+
+select
+  'READY'::text as scout_database_status,
+  250::integer as hard_daily_ceiling,
+  '90-210 seconds'::text as same_gmail_delay,
+  '3-6 seconds'::text as different_gmail_delay,
+  '3 occurrences in 14 days'::text as hard_restriction_rule,
+  to_regprocedure('public.reserve_sender_send(uuid,uuid,jsonb)') is not null as sender_safety_ready;
+-- <<< END SCOUT V10.38 FINAL SENDER RECOVERY + THREE-STRIKE PATCH
